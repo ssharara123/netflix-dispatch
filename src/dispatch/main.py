@@ -69,42 +69,6 @@ async def default_page(request, call_next):
 
 
 # we create the Web API framework
-api = FastAPI(
-    title="Dispatch",
-    description="Welcome to Dispatch's API documentation! Here you will able to discover all of the ways you can interact with the Dispatch API.",
-    root_path="/api/v1",
-    docs_url=None,
-    openapi_url="/docs/openapi.json",
-    redoc_url="/docs",
-)
-
-
-def get_path_params_from_request(request: Request) -> str:
-    path_params = {}
-    for r in api_router.routes:
-        path_regex, path_format, param_converters = compile_path(r.path)
-        path = request["path"].removeprefix("/api/v1")  # remove the /api/v1 for matching
-        match = path_regex.match(path)
-        if match:
-            path_params = match.groupdict()
-    return path_params
-
-
-def get_path_template(request: Request) -> str:
-    if hasattr(request, "path"):
-        return ",".join(request.path.split("/")[1:])
-    return ".".join(request.url.path.split("/")[1:])
-
-
-REQUEST_ID_CTX_KEY: Final[str] = "request_id"
-_request_id_ctx_var: ContextVar[Optional[str]] = ContextVar(REQUEST_ID_CTX_KEY, default=None)
-
-
-def get_request_id() -> Optional[str]:
-    return _request_id_ctx_var.get()
-
-
-@api.middleware("http")
 async def db_session_middleware(request: Request, call_next):
     request_id = str(uuid1())
 
@@ -120,6 +84,62 @@ async def db_session_middleware(request: Request, call_next):
     # validate slug exists
     schema_names = inspect(engine).get_schema_names()
     if schema in schema_names:
+        # SECURITY FIX: Broken Access Control - Verify user authorization before setting organization schema
+        # Vulnerability: The organization path parameter is user-controlled. Previously, only schema existence
+        # was checked, allowing any authenticated user to access any organization's data by changing the path.
+        # Fix: Extract the authenticated user from the JWT token and verify organization membership before
+        # setting the schema translation map. This preserves multi-tenant schema isolation while preventing
+        # horizontal privilege escalation.
+
+        # Skip authorization check for default organization (public/shared resources)
+        if organization_slug != "default":
+            # Extract user identity from JWT token in Authorization header
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                _request_id_ctx_var.reset(ctx_token)
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": [{"msg": "Authentication required to access organization resources"}]},
+                )
+
+            token = auth_header[7:]
+            try:
+                # Verify JWT signature to prevent token forgery and extract user identity
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                user_email = payload.get("sub")
+            except Exception:
+                _request_id_ctx_var.reset(ctx_token)
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": [{"msg": "Invalid or expired authentication token"}]},
+                )
+
+            if not user_email:
+                _request_id_ctx_var.reset(ctx_token)
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": [{"msg": "Unable to determine user identity from token"}]},
+                )
+
+            # Verify user has access to the requested organization using a session on the default schema
+            # Uses parameterized query to prevent SQL injection
+            # This prevents horizontal privilege escalation by checking membership before schema selection
+            verification_session = sessionmaker(bind=engine)()
+            try:
+                has_access = verification_session.execute(
+                    text("SELECT 1 FROM user_organization WHERE user_email = :email AND organization_slug = :slug"),
+                    {"email": user_email, "slug": organization_slug}
+                ).fetchone()
+
+                if not has_access:
+                    _request_id_ctx_var.reset(ctx_token)
+                    return JSONResponse(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        content={"detail": [{"msg": "Access denied: user is not a member of this organization"}]},
+                    )
+            finally:
+                verification_session.close()
+
         # add correct schema mapping depending on the request
         schema_engine = engine.execution_options(
             schema_translate_map={
